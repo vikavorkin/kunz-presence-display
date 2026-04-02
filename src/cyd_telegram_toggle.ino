@@ -36,6 +36,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -46,8 +47,8 @@
 // USER CONFIGURATION (compile-time defaults)
 // These are used only if no value has been saved via the web interface.
 // ─────────────────────────────────────────────
-const char* WIFI_SSID     = "";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID     = "kunz_gsm2.4";
+const char* WIFI_PASSWORD = "kunzkunz";
 
 // Default Telegram credentials (overridden by NVS / web config)
 #define DEFAULT_BOT_TOKEN  ""
@@ -115,6 +116,8 @@ const char* NTP_SERVER     = "pool.ntp.org";
 #define COL_ELAPSED   0x8C71    // medium grey
 
 // ── Runtime config (loaded from NVS, overrides compile-time defaults) ─
+char     cfgWifiSsid[64];
+char     cfgWifiPass[64];
 char     cfgBotToken[128];
 char     cfgChatId[32];
 char     cfgMsgOn[128];
@@ -123,6 +126,7 @@ uint8_t  cfgBtnPin    = DEFAULT_BTN_PIN;
 uint32_t cfgBlDimMs   = DEFAULT_BL_DIM_AFTER_MS;
 uint8_t  cfgBlFull    = DEFAULT_BL_FULL;
 uint8_t  cfgBlDim     = DEFAULT_BL_DIM;
+char     cfgApPass[16]; // random AP password, generated once and stored in NVS
 
 // ── Objects ───────────────────────────────────
 TFT_eSPI tft;
@@ -136,6 +140,7 @@ WebServer webServer(80);
 // ── State ─────────────────────────────────────
 String        deviceIP       = "";
 bool          toggleState    = false;
+volatile bool          otaInProgress  = false;
 String        lastSentText   = "";
 unsigned long toggledAt      = 0;    // millis() at last toggle; 0 = unknown
 bool          ntpSynced      = false;
@@ -152,6 +157,8 @@ static char prevElapsed[32] = "";
 
 void loadConfig() {
   prefs.begin("tgcfg", /*readOnly=*/true);
+  String wifiSsid = prefs.getString("wifiSsid",  WIFI_SSID);
+  String wifiPass = prefs.getString("wifiPass",  WIFI_PASSWORD);
   String token  = prefs.getString("botToken",  DEFAULT_BOT_TOKEN);
   String chatId = prefs.getString("chatId",    DEFAULT_CHAT_ID);
   String msgOn  = prefs.getString("msgOn",     DEFAULT_MSG_ON);
@@ -160,32 +167,54 @@ void loadConfig() {
   cfgBlDimMs  = (uint32_t) prefs.getUInt("blDimMs",  DEFAULT_BL_DIM_AFTER_MS);
   cfgBlFull   = (uint8_t)  prefs.getUInt("blFull",   DEFAULT_BL_FULL);
   cfgBlDim    = (uint8_t)  prefs.getUInt("blDim",    DEFAULT_BL_DIM);
+  String apPass = prefs.getString("apPass", "");
   prefs.end();
+  wifiSsid.toCharArray(cfgWifiSsid, sizeof(cfgWifiSsid));
+  wifiPass.toCharArray(cfgWifiPass, sizeof(cfgWifiPass));
   token.toCharArray(cfgBotToken, sizeof(cfgBotToken));
   chatId.toCharArray(cfgChatId,  sizeof(cfgChatId));
   msgOn.toCharArray(cfgMsgOn,    sizeof(cfgMsgOn));
   msgOff.toCharArray(cfgMsgOff,  sizeof(cfgMsgOff));
-  Serial.printf("[CFG] botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
-                cfgBotToken, cfgChatId, cfgBtnPin, cfgBlDimMs, cfgBlFull, cfgBlDim);
+
+  if (apPass.length() == 0) {
+    // Generate a random 8-char AP password on first boot and persist it
+    static const char charset[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // omit I, O, 0, 1
+    char newPass[9];
+    for (int i = 0; i < 8; i++)
+      newPass[i] = charset[esp_random() % (sizeof(charset) - 1)];
+    newPass[8] = '\0';
+    prefs.begin("tgcfg", false);
+    prefs.putString("apPass", newPass);
+    prefs.end();
+    apPass = newPass;
+    Serial.printf("[CFG] Generated new AP password: %s\n", newPass);
+  }
+  apPass.toCharArray(cfgApPass, sizeof(cfgApPass));
+
+  Serial.printf("[CFG] wifiSsid=%s  botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
+                cfgWifiSsid, cfgBotToken, cfgChatId, cfgBtnPin, cfgBlDimMs, cfgBlFull, cfgBlDim);
   Serial.printf("[CFG] msgOn=%s  msgOff=%s\n", cfgMsgOn, cfgMsgOff);
 }
 
-void saveConfig(const char* token, const char* chatId,
+void saveConfig(const char* wifiSsid, const char* wifiPass,
+                const char* token, const char* chatId,
                 const char* msgOn, const char* msgOff,
                 uint8_t btnPin, uint32_t blDimMs,
                 uint8_t blFull, uint8_t blDim) {
   prefs.begin("tgcfg", /*readOnly=*/false);
-  prefs.putString("botToken", token);
-  prefs.putString("chatId",   chatId);
-  prefs.putString("msgOn",    msgOn);
-  prefs.putString("msgOff",   msgOff);
-  prefs.putUInt("btnPin",     btnPin);
-  prefs.putUInt("blDimMs",    blDimMs);
-  prefs.putUInt("blFull",     blFull);
-  prefs.putUInt("blDim",      blDim);
+  prefs.putString("wifiSsid",  wifiSsid);
+  prefs.putString("wifiPass",  wifiPass);
+  prefs.putString("botToken",  token);
+  prefs.putString("chatId",    chatId);
+  prefs.putString("msgOn",     msgOn);
+  prefs.putString("msgOff",    msgOff);
+  prefs.putUInt("btnPin",      btnPin);
+  prefs.putUInt("blDimMs",     blDimMs);
+  prefs.putUInt("blFull",      blFull);
+  prefs.putUInt("blDim",       blDim);
   prefs.end();
-  Serial.printf("[CFG] Saved botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
-                token, chatId, btnPin, blDimMs, blFull, blDim);
+  Serial.printf("[CFG] Saved wifiSsid=%s  botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
+                wifiSsid, token, chatId, btnPin, blDimMs, blFull, blDim);
   Serial.printf("[CFG] Saved msgOn=%s  msgOff=%s\n", msgOn, msgOff);
 }
 
@@ -208,7 +237,7 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   h2{margin:.5rem 0 1rem;font-size:.9rem;color:#666;font-weight:normal;
      border-bottom:1px solid #333;padding-bottom:.5rem}
   label{display:block;margin-bottom:.3rem;font-size:.85rem;color:#aaa}
-  .hint{font-size:.75rem;color:#555;margin-top:-.9rem;margin-bottom:1rem}
+  .hint{font-size:.75rem;color:#555;margin-top:-.1rem;margin-bottom:1rem}
   input{width:100%;box-sizing:border-box;padding:.6rem .8rem;border-radius:6px;
         border:1px solid #444;background:#111;color:#eee;font-size:.95rem;margin-bottom:.4rem}
   input:focus{outline:none;border-color:#4af}
@@ -224,6 +253,15 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <div class="card">
   <h1>&#9881; Device Config</h1>
   <form method="POST" action="/save">
+    <h2>WiFi</h2>
+    <label for="wssid">SSID</label>
+    <input id="wssid" name="wifiSsid" type="text" autocomplete="off"
+           placeholder="MyNetwork" value="%WIFISSID%">
+    <p class="hint">Takes effect after restart</p>
+    <label for="wpass">Password</label>
+    <input id="wpass" name="wifiPass" type="password" autocomplete="off"
+           placeholder="&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;" value="%WIFIPASS%" class="mb">
+
     <h2>Telegram</h2>
     <label for="tok">Bot Token</label>
     <input id="tok" name="botToken" type="text" autocomplete="off"
@@ -234,12 +272,12 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
            placeholder="123456789" value="%CHATID%" class="mb">
     <label for="mon">Open message</label>
     <input id="mon" name="msgOn" type="text" autocomplete="off"
-           placeholder="Place is now open!" value="%MSGON%">
-    <p class="hint">Sent when toggled to OPEN</p>
+           placeholder="&#x1F7E2; Place is now open!" value="%MSGON%">
+    <p class="hint">Sent when toggled to OPEN — emoji supported</p>
     <label for="moff">Closed message</label>
     <input id="moff" name="msgOff" type="text" autocomplete="off"
-           placeholder="Place is closed :(" value="%MSGOFF%" class="mb">
-    <p class="hint">Sent when toggled to CLOSED</p>
+           placeholder="&#x1F534; Place is closed" value="%MSGOFF%" class="mb">
+    <p class="hint">Sent when toggled to CLOSED — emoji supported</p>
 
     <h2>Hardware</h2>
     <div class="row">
@@ -275,6 +313,8 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 
 void handleConfigRoot() {
   String page = FPSTR(CONFIG_HTML);
+  page.replace("%WIFISSID%", String(cfgWifiSsid));
+  page.replace("%WIFIPASS%", String(cfgWifiPass));
   page.replace("%TOKEN%",   String(cfgBotToken));
   page.replace("%CHATID%",  String(cfgChatId));
   page.replace("%MSGON%",   String(cfgMsgOn));
@@ -287,7 +327,8 @@ void handleConfigRoot() {
 }
 
 void handleConfigSave() {
-  if (!webServer.hasArg("botToken") || !webServer.hasArg("chatId") ||
+  if (!webServer.hasArg("wifiSsid") || !webServer.hasArg("wifiPass") ||
+      !webServer.hasArg("botToken") || !webServer.hasArg("chatId") ||
       !webServer.hasArg("msgOn")    || !webServer.hasArg("msgOff") ||
       !webServer.hasArg("btnPin")   || !webServer.hasArg("blDimSec") ||
       !webServer.hasArg("blFull")   || !webServer.hasArg("blDim")) {
@@ -295,6 +336,8 @@ void handleConfigSave() {
     return;
   }
 
+  String wifiSsid = webServer.arg("wifiSsid");
+  String wifiPass = webServer.arg("wifiPass");
   String token    = webServer.arg("botToken");
   String chatId   = webServer.arg("chatId");
   String msgOn    = webServer.arg("msgOn");
@@ -303,17 +346,20 @@ void handleConfigSave() {
   String dimSecS  = webServer.arg("blDimSec");
   String blFullS  = webServer.arg("blFull");
   String blDimS   = webServer.arg("blDim");
+  wifiSsid.trim(); wifiPass.trim();
   token.trim(); chatId.trim(); msgOn.trim(); msgOff.trim();
   btnPinS.trim(); dimSecS.trim(); blFullS.trim(); blDimS.trim();
 
-  if (token.length() == 0 || chatId.length() == 0 ||
+  if (wifiSsid.length() == 0 ||
+      token.length() == 0 || chatId.length() == 0 ||
       msgOn.length() == 0  || msgOff.length() == 0 ||
       btnPinS.length() == 0 || dimSecS.length() == 0 ||
       blFullS.length() == 0 || blDimS.length() == 0) {
-    webServer.send(400, "text/plain", "Fields must not be empty");
+    webServer.send(400, "text/plain", "Fields must not be empty (WiFi password may be blank)");
     return;
   }
-  if (token.length() >= sizeof(cfgBotToken) || chatId.length() >= sizeof(cfgChatId) ||
+  if (wifiSsid.length() >= sizeof(cfgWifiSsid) || wifiPass.length() >= sizeof(cfgWifiPass) ||
+      token.length() >= sizeof(cfgBotToken) || chatId.length() >= sizeof(cfgChatId) ||
       msgOn.length() >= sizeof(cfgMsgOn)    || msgOff.length() >= sizeof(cfgMsgOff)) {
     webServer.send(400, "text/plain", "Value too long");
     return;
@@ -340,7 +386,8 @@ void handleConfigSave() {
     return;
   }
 
-  saveConfig(token.c_str(), chatId.c_str(),
+  saveConfig(wifiSsid.c_str(), wifiPass.c_str(),
+             token.c_str(), chatId.c_str(),
              msgOn.c_str(), msgOff.c_str(),
              (uint8_t)btnPin, (uint32_t)(dimSec * 1000),
              (uint8_t)blFull, (uint8_t)blDim);
@@ -363,6 +410,34 @@ void setupWebServer() {
   webServer.begin();
   Serial.printf("[WEB] Config server at http://%s/\n",
                 WiFi.localIP().toString().c_str());
+}
+
+// ─────────────────────────────────────────────
+// OTA
+// ─────────────────────────────────────────────
+
+void setupOTA() {
+  ArduinoOTA.setHostname("presence-display");
+
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    drawSplash("OTA update...");
+    Serial.println("[OTA] Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    otaInProgress = false;
+    Serial.println("\n[OTA] Done");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[OTA] %u%%\r", progress * 100 / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+    Serial.printf("[OTA] Error[%u]\n", error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.println("[OTA] Ready");
 }
 
 // ─────────────────────────────────────────────
@@ -600,6 +675,106 @@ bool sendTelegram(const String& text) {
 String stateToMsg(bool s) { return s ? String(cfgMsgOn) : String(cfgMsgOff); }
 
 // ─────────────────────────────────────────────
+// Access Point setup mode
+// ─────────────────────────────────────────────
+
+#define AP_SSID "PresenceSetup"
+
+void drawApSplash(const char* apSsid, const char* apPass, const char* apIp) {
+  tft.fillScreen(TFT_BLACK);
+
+  // Title bar
+  tft.fillRect(0, 0, SCREEN_W, 30, 0x0014);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_CYAN, 0x0014);
+  const char* title = "WiFi Setup Mode";
+  tft.setCursor((SCREEN_W - tft.textWidth(title)) / 2, 8);
+  tft.print(title);
+
+  // Instructions
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  const char* instr = "Connect to this network, then open:";
+  tft.setCursor((SCREEN_W - tft.textWidth(instr)) / 2, 42);
+  tft.print(instr);
+
+  // SSID row
+  tft.fillRoundRect(6, 58, SCREEN_W - 12, 34, 5, 0x1082);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, 0x1082);
+  tft.setCursor(14, 63);
+  tft.print("Network (SSID)");
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, 0x1082);
+  tft.setCursor(14, 74);
+  tft.print(apSsid);
+
+  // Password row
+  tft.fillRoundRect(6, 100, SCREEN_W - 12, 34, 5, 0x1082);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, 0x1082);
+  tft.setCursor(14, 105);
+  tft.print("Password");
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_YELLOW, 0x1082);
+  tft.setCursor(14, 116);
+  tft.print(apPass);
+
+  // URL row
+  tft.fillRoundRect(6, 142, SCREEN_W - 12, 34, 5, 0x1082);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, 0x1082);
+  tft.setCursor(14, 147);
+  tft.print("Config URL");
+  String url = String("http://") + apIp + "/";
+  tft.setTextSize(2);
+  tft.setTextColor(0x07FF, 0x1082);  // cyan
+  tft.setCursor(14, 158);
+  tft.print(url);
+
+  // Footer hint
+  tft.setTextSize(1);
+  tft.setTextColor(0x4208, TFT_BLACK);
+  const char* hint = "Device will restart after saving";
+  tft.setCursor((SCREEN_W - tft.textWidth(hint)) / 2, SCREEN_H - 12);
+  tft.print(hint);
+}
+
+void startAPMode() {
+  Serial.printf("[AP] Starting AP: SSID=%s  Pass=%s\n", AP_SSID, cfgApPass);
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, cfgApPass);
+  delay(200);
+
+  String apIp = WiFi.softAPIP().toString();
+  Serial.printf("[AP] IP: %s\n", apIp.c_str());
+
+  // Web server still uses the same handlers; update deviceIP for any frame rendering
+  deviceIP = apIp;
+  webServer.on("/",     HTTP_GET,  handleConfigRoot);
+  webServer.on("/save", HTTP_POST, handleConfigSave);
+  webServer.begin();
+  Serial.println("[AP] Web server started");
+
+  drawApSplash(AP_SSID, cfgApPass, apIp.c_str());
+
+  // Blink blue LED while in AP mode
+  pinMode(LED_BLUE, OUTPUT);
+  bool ledState = false;
+  while (true) {
+    webServer.handleClient();
+    static unsigned long lastBlink = 0;
+    if (millis() - lastBlink >= 800) {
+      lastBlink = millis();
+      ledState = !ledState;
+      digitalWrite(LED_BLUE, ledState ? LOW : HIGH);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
 // setup()
 // ─────────────────────────────────────────────
 
@@ -624,26 +799,24 @@ void setup() {
   ledcAttachPin(TFT_BL_PIN, BL_PWM_CHANNEL);
   ledcWrite(BL_PWM_CHANNEL, cfgBlFull);
   Serial.printf("[DIM] Backlight init: full brightness. Dim timeout: %lu ms\n", cfgBlDimMs);
-  drawSplash("Connecting to WiFi...");
-
   touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   ts.begin(touchSPI);
   ts.setRotation(1);
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // If no WiFi SSID has ever been configured, go straight to AP setup mode.
+  if (strlen(cfgWifiSsid) == 0) {
+    Serial.println("[WiFi] No SSID configured — starting AP setup mode");
+    startAPMode();  // never returns; device restarts after config save
+  }
+
+  drawSplash("Connecting to WiFi...");
+  WiFi.begin(cfgWifiSsid, cfgWifiPass);
   int att = 0;
   while (WiFi.status() != WL_CONNECTED && att++ < 40) delay(500);
 
   if (WiFi.status() != WL_CONNECTED) {
-    drawSplash("WiFi FAILED - offline");
-    delay(2000);
-    // Load config and create bot even when offline (token/chatId still needed)
-    loadConfig();
-    bot = new UniversalTelegramBot(cfgBotToken, secureClient);
-    drawFrame(false);
-    invalidateLiveCache();
-    updateLiveZones();
-    return;
+    Serial.println("[WiFi] Connection failed — starting AP setup mode");
+    startAPMode();  // never returns; device restarts after config save
   }
 
   deviceIP = WiFi.localIP().toString();
@@ -675,6 +848,7 @@ void setup() {
 
   // Start web config server
   setupWebServer();
+  setupOTA();
 
   // NTP sync
   drawSplash("Syncing time (NTP)...");
@@ -689,7 +863,7 @@ void setup() {
   lastSentText = fetchLastBotMessage();
   Serial.printf("[Init] Last TG msg: \"%s\"\n", lastSentText.c_str());
 
-  toggleState = (lastSentText == String(cfgMsgOn));
+  toggleState = (lastSentText == stateToMsg(true));
 
   // Restore elapsed time from NVS wall-clock timestamp
   prefs.begin("tgstate", /*readOnly=*/true);
@@ -727,8 +901,11 @@ uint32_t get_value()
 }
 
 void loop() {
+  ArduinoOTA.handle();
   // Handle incoming HTTP config requests
   webServer.handleClient();
+
+  if (otaInProgress) return;
 
   // 1-second clock/elapsed tick
   static unsigned long lastTick = 0;

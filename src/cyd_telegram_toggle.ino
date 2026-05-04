@@ -56,6 +56,12 @@ const char* WIFI_PASSWORD = "kunzkunz";
 #define DEFAULT_MSG_ON     "Place is now open!"
 #define DEFAULT_MSG_OFF    "Place is closed :("
 
+// Default Cloudflare Queue settings (overridden by NVS / web config)
+// Queue HTTP endpoint: https://api.cloudflare.com/client/v4/accounts/{id}/queues/{id}/messages
+#define DEFAULT_CF_QUEUE_URL ""
+#define DEFAULT_CF_API_TOKEN ""
+#define DEFAULT_CF_QUEUE_SEC 60   // periodic status publish interval in seconds
+
 // NTP timezone — seconds east of UTC
 //   UTC+0  London winter:  0
 //   UTC+1  Berlin winter:  3600
@@ -127,6 +133,9 @@ uint32_t cfgBlDimMs   = DEFAULT_BL_DIM_AFTER_MS;
 uint8_t  cfgBlFull    = DEFAULT_BL_FULL;
 uint8_t  cfgBlDim     = DEFAULT_BL_DIM;
 char     cfgApPass[16]; // random AP password, generated once and stored in NVS
+char     cfgCfQueueUrl[192]; // Cloudflare Queue HTTP endpoint URL (empty = disabled)
+char     cfgCfApiToken[72];  // Cloudflare API token with Queue write permission
+uint32_t cfgCfQueueSec = DEFAULT_CF_QUEUE_SEC; // periodic publish interval (seconds)
 
 // ── Objects ───────────────────────────────────
 TFT_eSPI tft;
@@ -168,6 +177,9 @@ void loadConfig() {
   cfgBlFull   = (uint8_t)  prefs.getUInt("blFull",   DEFAULT_BL_FULL);
   cfgBlDim    = (uint8_t)  prefs.getUInt("blDim",    DEFAULT_BL_DIM);
   String apPass = prefs.getString("apPass", "");
+  String cfQueueUrl = prefs.getString("cfQueueUrl", DEFAULT_CF_QUEUE_URL);
+  String cfApiToken = prefs.getString("cfApiToken", DEFAULT_CF_API_TOKEN);
+  cfgCfQueueSec = prefs.getUInt("cfQueueSec", DEFAULT_CF_QUEUE_SEC);
   prefs.end();
   wifiSsid.toCharArray(cfgWifiSsid, sizeof(cfgWifiSsid));
   wifiPass.toCharArray(cfgWifiPass, sizeof(cfgWifiPass));
@@ -190,6 +202,8 @@ void loadConfig() {
     Serial.printf("[CFG] Generated new AP password: %s\n", newPass);
   }
   apPass.toCharArray(cfgApPass, sizeof(cfgApPass));
+  cfQueueUrl.toCharArray(cfgCfQueueUrl, sizeof(cfgCfQueueUrl));
+  cfApiToken.toCharArray(cfgCfApiToken, sizeof(cfgCfApiToken));
 
   Serial.printf("[CFG] wifiSsid=%s  botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
                 cfgWifiSsid, cfgBotToken, cfgChatId, cfgBtnPin, cfgBlDimMs, cfgBlFull, cfgBlDim);
@@ -200,7 +214,9 @@ void saveConfig(const char* wifiSsid, const char* wifiPass,
                 const char* token, const char* chatId,
                 const char* msgOn, const char* msgOff,
                 uint8_t btnPin, uint32_t blDimMs,
-                uint8_t blFull, uint8_t blDim) {
+                uint8_t blFull, uint8_t blDim,
+                const char* cfQueueUrl, const char* cfApiToken,
+                uint32_t cfQueueSec) {
   prefs.begin("tgcfg", /*readOnly=*/false);
   prefs.putString("wifiSsid",  wifiSsid);
   prefs.putString("wifiPass",  wifiPass);
@@ -212,10 +228,14 @@ void saveConfig(const char* wifiSsid, const char* wifiPass,
   prefs.putUInt("blDimMs",     blDimMs);
   prefs.putUInt("blFull",      blFull);
   prefs.putUInt("blDim",       blDim);
+  prefs.putString("cfQueueUrl", cfQueueUrl);
+  prefs.putString("cfApiToken", cfApiToken);
+  prefs.putUInt("cfQueueSec",  cfQueueSec);
   prefs.end();
   Serial.printf("[CFG] Saved wifiSsid=%s  botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
                 wifiSsid, token, chatId, btnPin, blDimMs, blFull, blDim);
   Serial.printf("[CFG] Saved msgOn=%s  msgOff=%s\n", msgOn, msgOff);
+  Serial.printf("[CFG] Saved cfQueueUrl=%s  cfQueueSec=%u\n", cfQueueUrl, cfQueueSec);
 }
 
 // ─────────────────────────────────────────────
@@ -305,6 +325,21 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
       </div>
     </div>
 
+    <h2>Cloudflare Queue</h2>
+    <label for="cfurl">Queue URL</label>
+    <input id="cfurl" name="cfQueueUrl" type="text" autocomplete="off"
+           placeholder="https://api.cloudflare.com/client/v4/accounts/.../queues/.../messages"
+           value="%CFQUEUEURL%">
+    <p class="hint">Leave blank to disable. Paste full endpoint URL from CF dashboard.</p>
+    <label for="cftoken">API Token</label>
+    <input id="cftoken" name="cfApiToken" type="password" autocomplete="off"
+           placeholder="CF API token with Queue write permission" value="%CFAPITOKEN%">
+    <p class="hint">Create at dash.cloudflare.com &rarr; My Profile &rarr; API Tokens</p>
+    <label for="cfinterval">Publish interval (seconds)</label>
+    <input id="cfinterval" name="cfQueueSec" type="number" min="10" max="3600"
+           value="%CFQUEUESEC%" class="mb">
+    <p class="hint">How often to periodically push status (10&ndash;3600 s). Also sent immediately on toggle.</p>
+
     <button type="submit">Save &amp; Restart</button>
   </form>
 </div>
@@ -321,8 +356,11 @@ void handleConfigRoot() {
   page.replace("%MSGOFF%",  String(cfgMsgOff));
   page.replace("%BTNPIN%",  String(cfgBtnPin));
   page.replace("%BLDIMSEC%", String(cfgBlDimMs / 1000));
-  page.replace("%BLFULL%",  String(cfgBlFull));
-  page.replace("%BLDIM%",   String(cfgBlDim));
+  page.replace("%BLFULL%",     String(cfgBlFull));
+  page.replace("%BLDIM%",      String(cfgBlDim));
+  page.replace("%CFQUEUEURL%", String(cfgCfQueueUrl));
+  page.replace("%CFAPITOKEN%", String(cfgCfApiToken));
+  page.replace("%CFQUEUESEC%", String(cfgCfQueueSec));
   webServer.send(200, "text/html", page);
 }
 
@@ -331,24 +369,29 @@ void handleConfigSave() {
       !webServer.hasArg("botToken") || !webServer.hasArg("chatId") ||
       !webServer.hasArg("msgOn")    || !webServer.hasArg("msgOff") ||
       !webServer.hasArg("btnPin")   || !webServer.hasArg("blDimSec") ||
-      !webServer.hasArg("blFull")   || !webServer.hasArg("blDim")) {
+      !webServer.hasArg("blFull")   || !webServer.hasArg("blDim")   ||
+      !webServer.hasArg("cfQueueSec")) {
     webServer.send(400, "text/plain", "Missing fields");
     return;
   }
 
-  String wifiSsid = webServer.arg("wifiSsid");
-  String wifiPass = webServer.arg("wifiPass");
-  String token    = webServer.arg("botToken");
-  String chatId   = webServer.arg("chatId");
-  String msgOn    = webServer.arg("msgOn");
-  String msgOff   = webServer.arg("msgOff");
-  String btnPinS  = webServer.arg("btnPin");
-  String dimSecS  = webServer.arg("blDimSec");
-  String blFullS  = webServer.arg("blFull");
-  String blDimS   = webServer.arg("blDim");
+  String wifiSsid   = webServer.arg("wifiSsid");
+  String wifiPass   = webServer.arg("wifiPass");
+  String token      = webServer.arg("botToken");
+  String chatId     = webServer.arg("chatId");
+  String msgOn      = webServer.arg("msgOn");
+  String msgOff     = webServer.arg("msgOff");
+  String btnPinS    = webServer.arg("btnPin");
+  String dimSecS    = webServer.arg("blDimSec");
+  String blFullS    = webServer.arg("blFull");
+  String blDimS     = webServer.arg("blDim");
+  String cfQueueUrl = webServer.hasArg("cfQueueUrl") ? webServer.arg("cfQueueUrl") : "";
+  String cfApiToken = webServer.hasArg("cfApiToken") ? webServer.arg("cfApiToken") : "";
+  String cfQueueSecS = webServer.arg("cfQueueSec");
   wifiSsid.trim(); wifiPass.trim();
   token.trim(); chatId.trim(); msgOn.trim(); msgOff.trim();
   btnPinS.trim(); dimSecS.trim(); blFullS.trim(); blDimS.trim();
+  cfQueueUrl.trim(); cfApiToken.trim(); cfQueueSecS.trim();
 
   if (wifiSsid.length() == 0 ||
       token.length() == 0 || chatId.length() == 0 ||
@@ -358,17 +401,23 @@ void handleConfigSave() {
     webServer.send(400, "text/plain", "Fields must not be empty (WiFi password may be blank)");
     return;
   }
+  if (cfQueueUrl.length() > 0 && cfApiToken.length() == 0) {
+    webServer.send(400, "text/plain", "API Token required when Queue URL is set");
+    return;
+  }
   if (wifiSsid.length() >= sizeof(cfgWifiSsid) || wifiPass.length() >= sizeof(cfgWifiPass) ||
       token.length() >= sizeof(cfgBotToken) || chatId.length() >= sizeof(cfgChatId) ||
-      msgOn.length() >= sizeof(cfgMsgOn)    || msgOff.length() >= sizeof(cfgMsgOff)) {
+      msgOn.length() >= sizeof(cfgMsgOn)    || msgOff.length() >= sizeof(cfgMsgOff) ||
+      cfQueueUrl.length() >= sizeof(cfgCfQueueUrl) || cfApiToken.length() >= sizeof(cfgCfApiToken)) {
     webServer.send(400, "text/plain", "Value too long");
     return;
   }
 
-  int btnPin  = btnPinS.toInt();
-  int dimSec  = dimSecS.toInt();
-  int blFull  = blFullS.toInt();
-  int blDim   = blDimS.toInt();
+  int btnPin    = btnPinS.toInt();
+  int dimSec    = dimSecS.toInt();
+  int blFull    = blFullS.toInt();
+  int blDim     = blDimS.toInt();
+  int cfQueueSec = cfQueueSecS.length() > 0 ? cfQueueSecS.toInt() : DEFAULT_CF_QUEUE_SEC;
   if (btnPin < 0 || btnPin > 39) {
     webServer.send(400, "text/plain", "Button GPIO must be 0-39");
     return;
@@ -385,12 +434,18 @@ void handleConfigSave() {
     webServer.send(400, "text/plain", "Dim brightness must be less than full brightness");
     return;
   }
+  if (cfQueueSec < 10 || cfQueueSec > 3600) {
+    webServer.send(400, "text/plain", "CF Queue interval must be 10-3600 s");
+    return;
+  }
 
   saveConfig(wifiSsid.c_str(), wifiPass.c_str(),
              token.c_str(), chatId.c_str(),
              msgOn.c_str(), msgOff.c_str(),
              (uint8_t)btnPin, (uint32_t)(dimSec * 1000),
-             (uint8_t)blFull, (uint8_t)blDim);
+             (uint8_t)blFull, (uint8_t)blDim,
+             cfQueueUrl.c_str(), cfApiToken.c_str(),
+             (uint32_t)cfQueueSec);
 
   webServer.send(200, "text/html",
     "<html><head><meta charset='utf-8'>"
@@ -675,6 +730,40 @@ bool sendTelegram(const String& text) {
 String stateToMsg(bool s) { return s ? String(cfgMsgOn) : String(cfgMsgOff); }
 
 // ─────────────────────────────────────────────
+// Cloudflare Queue — HTTP publish
+// POST {"messages":[{"body":{"status":"open","ts":1234},"content_type":"application/json"}]}
+// to the configured queue endpoint with Bearer auth.
+// ─────────────────────────────────────────────
+
+bool sendToCloudflareQueue(bool state) {
+  if (strlen(cfgCfQueueUrl) == 0) return false;
+
+  StaticJsonDocument<256> doc;
+  JsonArray messages = doc.createNestedArray("messages");
+  JsonObject msg     = messages.createNestedObject();
+  JsonObject body    = msg.createNestedObject("body");
+  body["status"] = state ? "open" : "closed";
+  body["ts"]     = (uint32_t)time(nullptr);
+  msg["content_type"] = "application/json";
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClientSecure cfClient;
+  cfClient.setInsecure();
+  HTTPClient https;
+  https.begin(cfClient, cfgCfQueueUrl);
+  https.addHeader("Content-Type",  "application/json");
+  https.addHeader("Authorization", String("Bearer ") + cfgCfApiToken);
+  int code = https.POST(payload);
+  https.end();
+
+  Serial.printf("[CF] Queue POST status=%s ts=%u → HTTP %d\n",
+                state ? "open" : "closed", (uint32_t)time(nullptr), code);
+  return code >= 200 && code < 300;
+}
+
+// ─────────────────────────────────────────────
 // Access Point setup mode
 // ─────────────────────────────────────────────
 
@@ -914,6 +1003,14 @@ void loop() {
     updateLiveZones();
   }
 
+  // Periodic Cloudflare Queue publish
+  static unsigned long lastCfSend = 0;
+  unsigned long cfIntervalMs = (unsigned long)cfgCfQueueSec * 1000UL;
+  if (strlen(cfgCfQueueUrl) > 0 && millis() - lastCfSend >= cfIntervalMs) {
+    lastCfSend = millis();
+    sendToCloudflareQueue(toggleState);
+  }
+
   // Backlight dimming after inactivity
   static bool dimmed = false;
   if (!dimmed && millis() - lastActivityAt >= get_value()) {
@@ -976,6 +1073,12 @@ void loop() {
     drawFrame(toggleState);
     invalidateLiveCache();
     updateLiveZones();
+  }
+
+  // Publish new state to Cloudflare Queue immediately on toggle
+  if (strlen(cfgCfQueueUrl) > 0) {
+    sendToCloudflareQueue(toggleState);
+    lastCfSend = millis();  // reset periodic timer so we don't double-send
   }
 }
 

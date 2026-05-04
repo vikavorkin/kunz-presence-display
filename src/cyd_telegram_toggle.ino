@@ -119,7 +119,7 @@ const char* NTP_SERVER     = "pool.ntp.org";
 char     cfgWifiSsid[64];
 char     cfgWifiPass[64];
 char     cfgBotToken[128];
-char     cfgChatId[32];
+char     cfgChatIds[256]; // comma-separated list of chat IDs
 char     cfgMsgOn[128];
 char     cfgMsgOff[128];
 uint8_t  cfgBtnPin    = DEFAULT_BTN_PIN;
@@ -159,9 +159,9 @@ void loadConfig() {
   prefs.begin("tgcfg", /*readOnly=*/true);
   String wifiSsid = prefs.getString("wifiSsid",  WIFI_SSID);
   String wifiPass = prefs.getString("wifiPass",  WIFI_PASSWORD);
-  String token  = prefs.getString("botToken",  DEFAULT_BOT_TOKEN);
-  String chatId = prefs.getString("chatId",    DEFAULT_CHAT_ID);
-  String msgOn  = prefs.getString("msgOn",     DEFAULT_MSG_ON);
+  String token    = prefs.getString("botToken",  DEFAULT_BOT_TOKEN);
+  String chatIds  = prefs.getString("chatId",    DEFAULT_CHAT_ID);
+  String msgOn    = prefs.getString("msgOn",     DEFAULT_MSG_ON);
   String msgOff = prefs.getString("msgOff",    DEFAULT_MSG_OFF);
   cfgBtnPin   = (uint8_t)  prefs.getUInt("btnPin",   DEFAULT_BTN_PIN);
   cfgBlDimMs  = (uint32_t) prefs.getUInt("blDimMs",  DEFAULT_BL_DIM_AFTER_MS);
@@ -171,9 +171,9 @@ void loadConfig() {
   prefs.end();
   wifiSsid.toCharArray(cfgWifiSsid, sizeof(cfgWifiSsid));
   wifiPass.toCharArray(cfgWifiPass, sizeof(cfgWifiPass));
-  token.toCharArray(cfgBotToken, sizeof(cfgBotToken));
-  chatId.toCharArray(cfgChatId,  sizeof(cfgChatId));
-  msgOn.toCharArray(cfgMsgOn,    sizeof(cfgMsgOn));
+  token.toCharArray(cfgBotToken,   sizeof(cfgBotToken));
+  chatIds.toCharArray(cfgChatIds,  sizeof(cfgChatIds));
+  msgOn.toCharArray(cfgMsgOn,      sizeof(cfgMsgOn));
   msgOff.toCharArray(cfgMsgOff,  sizeof(cfgMsgOff));
 
   if (apPass.length() == 0) {
@@ -191,8 +191,8 @@ void loadConfig() {
   }
   apPass.toCharArray(cfgApPass, sizeof(cfgApPass));
 
-  Serial.printf("[CFG] wifiSsid=%s  botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
-                cfgWifiSsid, cfgBotToken, cfgChatId, cfgBtnPin, cfgBlDimMs, cfgBlFull, cfgBlDim);
+  Serial.printf("[CFG] wifiSsid=%s  botToken=%s  chatIds=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
+                cfgWifiSsid, cfgBotToken, cfgChatIds, cfgBtnPin, cfgBlDimMs, cfgBlFull, cfgBlDim);
   Serial.printf("[CFG] msgOn=%s  msgOff=%s\n", cfgMsgOn, cfgMsgOff);
 }
 
@@ -238,9 +238,10 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
      border-bottom:1px solid #333;padding-bottom:.5rem}
   label{display:block;margin-bottom:.3rem;font-size:.85rem;color:#aaa}
   .hint{font-size:.75rem;color:#555;margin-top:-.1rem;margin-bottom:1rem}
-  input{width:100%;box-sizing:border-box;padding:.6rem .8rem;border-radius:6px;
+  input,textarea{width:100%;box-sizing:border-box;padding:.6rem .8rem;border-radius:6px;
         border:1px solid #444;background:#111;color:#eee;font-size:.95rem;margin-bottom:.4rem}
-  input:focus{outline:none;border-color:#4af}
+  input:focus,textarea:focus{outline:none;border-color:#4af}
+  textarea{resize:vertical;font-family:monospace;font-size:.85rem}
   .row{display:flex;gap:.75rem}
   .row input{margin-bottom:.4rem}
   .mb{margin-bottom:1.2rem}
@@ -267,9 +268,10 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
     <input id="tok" name="botToken" type="text" autocomplete="off"
            placeholder="1234567890:AAB..." value="%TOKEN%">
     <p class="hint">Obtain from @BotFather on Telegram</p>
-    <label for="cid">Chat ID</label>
-    <input id="cid" name="chatId" type="text" autocomplete="off"
-           placeholder="123456789" value="%CHATID%" class="mb">
+    <label for="cid">Chat IDs (one per line)</label>
+    <textarea id="cid" name="chatId" rows="3" autocomplete="off"
+              placeholder="123456789&#10;-987654321&#10;-1001234567890">%CHATID%</textarea>
+    <p class="hint">Enter one chat ID per line — group IDs start with -, channel IDs start with -100</p>
     <label for="mon">Open message</label>
     <input id="mon" name="msgOn" type="text" autocomplete="off"
            placeholder="&#x1F7E2; Place is now open!" value="%MSGON%">
@@ -316,7 +318,7 @@ void handleConfigRoot() {
   page.replace("%WIFISSID%", String(cfgWifiSsid));
   page.replace("%WIFIPASS%", String(cfgWifiPass));
   page.replace("%TOKEN%",   String(cfgBotToken));
-  page.replace("%CHATID%",  String(cfgChatId));
+  { String ids = String(cfgChatIds); ids.replace(",", "\n"); page.replace("%CHATID%", ids); }
   page.replace("%MSGON%",   String(cfgMsgOn));
   page.replace("%MSGOFF%",  String(cfgMsgOff));
   page.replace("%BTNPIN%",  String(cfgBtnPin));
@@ -339,7 +341,6 @@ void handleConfigSave() {
   String wifiSsid = webServer.arg("wifiSsid");
   String wifiPass = webServer.arg("wifiPass");
   String token    = webServer.arg("botToken");
-  String chatId   = webServer.arg("chatId");
   String msgOn    = webServer.arg("msgOn");
   String msgOff   = webServer.arg("msgOff");
   String btnPinS  = webServer.arg("btnPin");
@@ -347,8 +348,26 @@ void handleConfigSave() {
   String blFullS  = webServer.arg("blFull");
   String blDimS   = webServer.arg("blDim");
   wifiSsid.trim(); wifiPass.trim();
-  token.trim(); chatId.trim(); msgOn.trim(); msgOff.trim();
+  token.trim(); msgOn.trim(); msgOff.trim();
   btnPinS.trim(); dimSecS.trim(); blFullS.trim(); blDimS.trim();
+
+  // Normalize textarea: CRLF/CR → comma-separated, skip blank lines
+  String chatIdRaw = webServer.arg("chatId");
+  chatIdRaw.replace("\r\n", "\n");
+  chatIdRaw.replace("\r", "\n");
+  String chatId = "";
+  int pos = 0;
+  while (pos <= (int)chatIdRaw.length()) {
+    int nl = chatIdRaw.indexOf('\n', pos);
+    String line = chatIdRaw.substring(pos, nl == -1 ? chatIdRaw.length() : nl);
+    line.trim();
+    if (line.length() > 0) {
+      if (chatId.length() > 0) chatId += ",";
+      chatId += line;
+    }
+    if (nl == -1) break;
+    pos = nl + 1;
+  }
 
   if (wifiSsid.length() == 0 ||
       token.length() == 0 || chatId.length() == 0 ||
@@ -359,7 +378,7 @@ void handleConfigSave() {
     return;
   }
   if (wifiSsid.length() >= sizeof(cfgWifiSsid) || wifiPass.length() >= sizeof(cfgWifiPass) ||
-      token.length() >= sizeof(cfgBotToken) || chatId.length() >= sizeof(cfgChatId) ||
+      token.length() >= sizeof(cfgBotToken) || chatId.length() >= sizeof(cfgChatIds) ||
       msgOn.length() >= sizeof(cfgMsgOn)    || msgOff.length() >= sizeof(cfgMsgOff)) {
     webServer.send(400, "text/plain", "Value too long");
     return;
@@ -641,34 +660,36 @@ String fetchLastBotMessage() {
 
 bool sendTelegram(const String& text) {
   Serial.printf("[TG] Sending: %s\n", text.c_str());
-  if (bot->sendMessage(cfgChatId, text, "")) {
+
+  // Iterate over comma-separated chat IDs
+  String ids = String(cfgChatIds);
+  bool anyOk = false;
+  int start = 0;
+  while (true) {
+    int comma = ids.indexOf(',', start);
+    String id = ids.substring(start, comma == -1 ? ids.length() : comma);
+    id.trim();
+    if (id.length() > 0) {
+      if (bot->sendMessage(id.c_str(), text, "")) {
+        Serial.printf("[TG] OK → %s\n", id.c_str());
+        anyOk = true;
+      } else {
+        Serial.printf("[TG] FAILED → %s (WiFi=%d)\n", id.c_str(), (int)WiFi.status());
+      }
+    }
+    if (comma == -1) break;
+    start = comma + 1;
+  }
+
+  if (anyOk) {
     lastSentText = text;
     prefs.begin("tgstate", /*readOnly=*/false);
     prefs.putString("lastMsg", text);
     prefs.putUInt("toggleTime", (uint32_t)time(nullptr));
     prefs.end();
-    Serial.println("[TG] OK (state persisted to NVS)");
-
-    // int msgId = bot->last_sent_message_id;
-    // if (msgId > 0) {
-    //   String pinUrl = String("https://api.telegram.org/bot") + cfgBotToken +
-    //                   "/pinChatMessage?chat_id=" + cfgChatId +
-    //                   "&message_id=" + msgId +
-    //                   "&disable_notification=true";
-    //   HTTPClient https;
-    //   secureClient.setInsecure();
-    //   https.begin(secureClient, pinUrl);
-    //   int code = https.GET();
-    //   Serial.printf("[TG] Pin message_id=%d: HTTP %d\n", msgId, code);
-    //   https.end();
-    // } else {
-    //   Serial.println("[TG] Pin skipped: message_id not available");
-    // }
-
+    Serial.println("[TG] State persisted to NVS");
     return true;
   }
-  Serial.printf("[TG] FAILED (WiFi status=%d, last_err=%d)\n",
-                (int)WiFi.status(), (int)secureClient.lastError(nullptr, 0));
   return false;
 }
 

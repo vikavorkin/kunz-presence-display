@@ -58,9 +58,10 @@ const char* WIFI_PASSWORD = "kunzkunz";
 
 // Default Cloudflare Queue settings (overridden by NVS / web config)
 // Queue HTTP endpoint: https://api.cloudflare.com/client/v4/accounts/{id}/queues/{id}/messages
-#define DEFAULT_CF_QUEUE_URL ""
-#define DEFAULT_CF_API_TOKEN ""
-#define DEFAULT_CF_QUEUE_SEC 60   // periodic status publish interval in seconds
+#define DEFAULT_CF_QUEUE_URL  ""
+#define DEFAULT_CF_API_TOKEN  ""
+#define DEFAULT_CF_QUEUE_SEC  60   // periodic status publish interval in seconds
+#define DEFAULT_CF_SVC_NAME   "presence-display"  // identifies this device in queue messages
 
 // NTP timezone — seconds east of UTC
 //   UTC+0  London winter:  0
@@ -136,6 +137,7 @@ char     cfgApPass[16]; // random AP password, generated once and stored in NVS
 char     cfgCfQueueUrl[192]; // Cloudflare Queue HTTP endpoint URL (empty = disabled)
 char     cfgCfApiToken[72];  // Cloudflare API token with Queue write permission
 uint32_t cfgCfQueueSec = DEFAULT_CF_QUEUE_SEC; // periodic publish interval (seconds)
+char     cfgCfSvcName[64];   // service/device label included in every queue message
 
 // ── Objects ───────────────────────────────────
 TFT_eSPI tft;
@@ -179,7 +181,8 @@ void loadConfig() {
   String apPass = prefs.getString("apPass", "");
   String cfQueueUrl = prefs.getString("cfQueueUrl", DEFAULT_CF_QUEUE_URL);
   String cfApiToken = prefs.getString("cfApiToken", DEFAULT_CF_API_TOKEN);
-  cfgCfQueueSec = prefs.getUInt("cfQueueSec", DEFAULT_CF_QUEUE_SEC);
+  cfgCfQueueSec     = prefs.getUInt("cfQueueSec",  DEFAULT_CF_QUEUE_SEC);
+  String cfSvcName  = prefs.getString("cfSvcName",  DEFAULT_CF_SVC_NAME);
   prefs.end();
   wifiSsid.toCharArray(cfgWifiSsid, sizeof(cfgWifiSsid));
   wifiPass.toCharArray(cfgWifiPass, sizeof(cfgWifiPass));
@@ -204,6 +207,7 @@ void loadConfig() {
   apPass.toCharArray(cfgApPass, sizeof(cfgApPass));
   cfQueueUrl.toCharArray(cfgCfQueueUrl, sizeof(cfgCfQueueUrl));
   cfApiToken.toCharArray(cfgCfApiToken, sizeof(cfgCfApiToken));
+  cfSvcName.toCharArray(cfgCfSvcName,  sizeof(cfgCfSvcName));
 
   Serial.printf("[CFG] wifiSsid=%s  botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
                 cfgWifiSsid, cfgBotToken, cfgChatId, cfgBtnPin, cfgBlDimMs, cfgBlFull, cfgBlDim);
@@ -216,7 +220,7 @@ void saveConfig(const char* wifiSsid, const char* wifiPass,
                 uint8_t btnPin, uint32_t blDimMs,
                 uint8_t blFull, uint8_t blDim,
                 const char* cfQueueUrl, const char* cfApiToken,
-                uint32_t cfQueueSec) {
+                uint32_t cfQueueSec, const char* cfSvcName) {
   prefs.begin("tgcfg", /*readOnly=*/false);
   prefs.putString("wifiSsid",  wifiSsid);
   prefs.putString("wifiPass",  wifiPass);
@@ -230,12 +234,14 @@ void saveConfig(const char* wifiSsid, const char* wifiPass,
   prefs.putUInt("blDim",       blDim);
   prefs.putString("cfQueueUrl", cfQueueUrl);
   prefs.putString("cfApiToken", cfApiToken);
-  prefs.putUInt("cfQueueSec",  cfQueueSec);
+  prefs.putUInt("cfQueueSec",   cfQueueSec);
+  prefs.putString("cfSvcName",  cfSvcName);
   prefs.end();
   Serial.printf("[CFG] Saved wifiSsid=%s  botToken=%s  chatId=%s  btnPin=%u  blDimMs=%u  blFull=%u  blDim=%u\n",
                 wifiSsid, token, chatId, btnPin, blDimMs, blFull, blDim);
   Serial.printf("[CFG] Saved msgOn=%s  msgOff=%s\n", msgOn, msgOff);
-  Serial.printf("[CFG] Saved cfQueueUrl=%s  cfQueueSec=%u\n", cfQueueUrl, cfQueueSec);
+  Serial.printf("[CFG] Saved cfQueueUrl=%s  cfQueueSec=%u  cfSvcName=%s\n",
+                cfQueueUrl, cfQueueSec, cfSvcName);
 }
 
 // ─────────────────────────────────────────────
@@ -326,6 +332,10 @@ static const char CONFIG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
     </div>
 
     <h2>Cloudflare Queue</h2>
+    <label for="cfsvc">Service name</label>
+    <input id="cfsvc" name="cfSvcName" type="text" autocomplete="off"
+           placeholder="presence-display" value="%CFSVNAME%">
+    <p class="hint">Identifies this device in queue messages — useful when multiple devices share one queue</p>
     <label for="cfurl">Queue URL</label>
     <input id="cfurl" name="cfQueueUrl" type="text" autocomplete="off"
            placeholder="https://api.cloudflare.com/client/v4/accounts/.../queues/.../messages"
@@ -358,6 +368,7 @@ void handleConfigRoot() {
   page.replace("%BLDIMSEC%", String(cfgBlDimMs / 1000));
   page.replace("%BLFULL%",     String(cfgBlFull));
   page.replace("%BLDIM%",      String(cfgBlDim));
+  page.replace("%CFSVNAME%",   String(cfgCfSvcName));
   page.replace("%CFQUEUEURL%", String(cfgCfQueueUrl));
   page.replace("%CFAPITOKEN%", String(cfgCfApiToken));
   page.replace("%CFQUEUESEC%", String(cfgCfQueueSec));
@@ -385,13 +396,15 @@ void handleConfigSave() {
   String dimSecS    = webServer.arg("blDimSec");
   String blFullS    = webServer.arg("blFull");
   String blDimS     = webServer.arg("blDim");
-  String cfQueueUrl = webServer.hasArg("cfQueueUrl") ? webServer.arg("cfQueueUrl") : "";
-  String cfApiToken = webServer.hasArg("cfApiToken") ? webServer.arg("cfApiToken") : "";
+  String cfQueueUrl  = webServer.hasArg("cfQueueUrl") ? webServer.arg("cfQueueUrl") : "";
+  String cfApiToken  = webServer.hasArg("cfApiToken") ? webServer.arg("cfApiToken") : "";
   String cfQueueSecS = webServer.arg("cfQueueSec");
+  String cfSvcName   = webServer.hasArg("cfSvcName")  ? webServer.arg("cfSvcName")  : DEFAULT_CF_SVC_NAME;
   wifiSsid.trim(); wifiPass.trim();
   token.trim(); chatId.trim(); msgOn.trim(); msgOff.trim();
   btnPinS.trim(); dimSecS.trim(); blFullS.trim(); blDimS.trim();
-  cfQueueUrl.trim(); cfApiToken.trim(); cfQueueSecS.trim();
+  cfQueueUrl.trim(); cfApiToken.trim(); cfQueueSecS.trim(); cfSvcName.trim();
+  if (cfSvcName.length() == 0) cfSvcName = DEFAULT_CF_SVC_NAME;
 
   if (wifiSsid.length() == 0 ||
       token.length() == 0 || chatId.length() == 0 ||
@@ -408,7 +421,8 @@ void handleConfigSave() {
   if (wifiSsid.length() >= sizeof(cfgWifiSsid) || wifiPass.length() >= sizeof(cfgWifiPass) ||
       token.length() >= sizeof(cfgBotToken) || chatId.length() >= sizeof(cfgChatId) ||
       msgOn.length() >= sizeof(cfgMsgOn)    || msgOff.length() >= sizeof(cfgMsgOff) ||
-      cfQueueUrl.length() >= sizeof(cfgCfQueueUrl) || cfApiToken.length() >= sizeof(cfgCfApiToken)) {
+      cfQueueUrl.length() >= sizeof(cfgCfQueueUrl) || cfApiToken.length() >= sizeof(cfgCfApiToken) ||
+      cfSvcName.length() >= sizeof(cfgCfSvcName)) {
     webServer.send(400, "text/plain", "Value too long");
     return;
   }
@@ -445,7 +459,7 @@ void handleConfigSave() {
              (uint8_t)btnPin, (uint32_t)(dimSec * 1000),
              (uint8_t)blFull, (uint8_t)blDim,
              cfQueueUrl.c_str(), cfApiToken.c_str(),
-             (uint32_t)cfQueueSec);
+             (uint32_t)cfQueueSec, cfSvcName.c_str());
 
   webServer.send(200, "text/html",
     "<html><head><meta charset='utf-8'>"
@@ -738,12 +752,13 @@ String stateToMsg(bool s) { return s ? String(cfgMsgOn) : String(cfgMsgOff); }
 bool sendToCloudflareQueue(bool state) {
   if (strlen(cfgCfQueueUrl) == 0) return false;
 
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<320> doc;
   JsonArray messages = doc.createNestedArray("messages");
   JsonObject msg     = messages.createNestedObject();
   JsonObject body    = msg.createNestedObject("body");
-  body["status"] = state ? "open" : "closed";
-  body["ts"]     = (uint32_t)time(nullptr);
+  body["service"] = cfgCfSvcName;
+  body["status"]  = state ? "open" : "closed";
+  body["ts"]      = (uint32_t)time(nullptr);
   msg["content_type"] = "application/json";
 
   String payload;

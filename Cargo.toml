@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2021"
 resolver = "2"
 
+# Library crate: pure-Rust logic, no ESP-IDF deps.
+# Compiled for both the embedded target and the host.
+# Test with: cargo test --target x86_64-unknown-linux-gnu --lib
+[lib]
+name = "kunz_presence_display"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kunz-presence-display"
+path = "src/main.rs"
 harness = false
 
 [profile.dev]

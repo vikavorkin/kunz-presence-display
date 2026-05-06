@@ -3,8 +3,9 @@ use esp_idf_svc::{
     http::server::{Configuration as ServerConfig, EspHttpServer},
     nvs::EspDefaultNvsPartition,
 };
-use log::info;
-use std::io::Read;
+use kunz_presence_display::logic::parse_form_urlencoded;
+use log::{error, info};
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{save_config, AppConfig};
@@ -101,26 +102,26 @@ pub fn start_server(
     nvs_partition: EspDefaultNvsPartition,
 ) -> Result<EspHttpServer<'static>> {
     let server_config = ServerConfig {
-        stack_size: 10240,
+        stack_size: 12288, // extra headroom for OTA write buffer
         ..Default::default()
     };
     let mut server = EspHttpServer::new(&server_config)?;
 
-    // GET / — serve config form
+    // ── GET / — config form ──────────────────────────────────────
     let cfg_for_get = shared_cfg.clone();
     server.fn_handler::<anyhow::Error, _>("/", esp_idf_svc::http::Method::Get, move |req| {
         let cfg = cfg_for_get.lock().unwrap();
         let page = CONFIG_HTML
             .replace("{WIFISSID}", &cfg.wifi_ssid)
             .replace("{WIFIPASS}", &cfg.wifi_pass)
-            .replace("{TOKEN}",   &cfg.bot_token)
-            .replace("{CHATID}",  &cfg.chat_id)
-            .replace("{MSGON}",   &cfg.msg_on)
-            .replace("{MSGOFF}",  &cfg.msg_off)
-            .replace("{BTNPIN}",  &cfg.btn_pin.to_string())
+            .replace("{TOKEN}",    &cfg.bot_token)
+            .replace("{CHATID}",   &cfg.chat_id)
+            .replace("{MSGON}",    &cfg.msg_on)
+            .replace("{MSGOFF}",   &cfg.msg_off)
+            .replace("{BTNPIN}",   &cfg.btn_pin.to_string())
             .replace("{BLDIMSEC}", &(cfg.bl_dim_ms / 1000).to_string())
-            .replace("{BLFULL}",  &cfg.bl_full.to_string())
-            .replace("{BLDIM}",   &cfg.bl_dim.to_string());
+            .replace("{BLFULL}",   &cfg.bl_full.to_string())
+            .replace("{BLDIM}",    &cfg.bl_dim.to_string());
         drop(cfg);
 
         req.into_response(200, Some("OK"), &[("Content-Type", "text/html; charset=utf-8")])?
@@ -128,28 +129,12 @@ pub fn start_server(
         Ok(())
     })?;
 
-    // POST /save — validate, persist, restart
+    // ── POST /save — validate, persist, restart ──────────────────
     let cfg_for_save = shared_cfg;
-    let nvs_for_save = nvs_partition;
+    let nvs_for_save = nvs_partition.clone();
     server.fn_handler::<anyhow::Error, _>("/save", esp_idf_svc::http::Method::Post, move |mut req| {
-        let mut body = Vec::new();
-        let mut chunk = [0u8; 512];
-        loop {
-            match req.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => body.extend_from_slice(&chunk[..n]),
-                Err(_) => break,
-            }
-        }
-
-        let form = match parse_form_urlencoded(&body) {
-            Ok(f) => f,
-            Err(e) => {
-                req.into_response(400, Some("Bad Request"), &[])?
-                    .write_all(e.to_string().as_bytes())?;
-                return Ok(());
-            }
-        };
+        let body = read_body(&mut req);
+        let form = parse_form_urlencoded(&body);
 
         let get = |key: &str| -> Result<String> {
             form.iter()
@@ -164,25 +149,20 @@ pub fn start_server(
         let chat_id   = get("chatId")?.trim().to_string();
         let msg_on    = get("msgOn")?.trim().to_string();
         let msg_off   = get("msgOff")?.trim().to_string();
-        let btn_pin: u8 = get("btnPin")?.trim().parse()?;
+        let btn_pin: u8  = get("btnPin")?.trim().parse()?;
         let dim_sec: u32 = get("blDimSec")?.trim().parse()?;
         let bl_full: u8  = get("blFull")?.trim().parse()?;
         let bl_dim: u8   = get("blDim")?.trim().parse()?;
 
-        // Validate
         if wifi_ssid.is_empty() {
-            req.into_response(400, Some("Bad Request"), &[])?
-                .write_all(b"WiFi SSID must not be empty")?;
-            return Ok(());
+            anyhow::bail!("WiFi SSID must not be empty");
         }
         if bot_token.is_empty() || chat_id.is_empty() || msg_on.is_empty() || msg_off.is_empty() {
-            req.into_response(400, Some("Bad Request"), &[])?
-                .write_all(b"Telegram fields must not be empty")?;
-            return Ok(());
+            anyhow::bail!("Telegram fields must not be empty");
         }
-        if btn_pin > 39 { anyhow::bail!("Button GPIO must be 0-39"); }
-        if !(5..=3600).contains(&dim_sec) { anyhow::bail!("Dim timeout 5-3600 s"); }
-        if bl_dim >= bl_full { anyhow::bail!("Dim brightness must be less than full"); }
+        if btn_pin > 39                    { anyhow::bail!("Button GPIO must be 0-39"); }
+        if !(5..=3600).contains(&dim_sec)  { anyhow::bail!("Dim timeout must be 5-3600 s"); }
+        if bl_dim >= bl_full               { anyhow::bail!("Dim brightness must be less than full brightness"); }
 
         let new_cfg = {
             let mut cfg = cfg_for_save.lock().unwrap();
@@ -213,51 +193,80 @@ pub fn start_server(
         Ok(())
     })?;
 
-    info!("[WEB] Config server started");
+    // ── POST /ota — receive firmware binary and apply via ESP-IDF OTA ──
+    //
+    // Usage (after building):
+    //   scripts/ota_upload.sh <device-ip>
+    //
+    // The device applies the update and reboots into the new firmware.
+    // The flash partition layout must have two OTA slots
+    // (CONFIG_PARTITION_TABLE_TWO_OTA=y in sdkconfig.defaults).
+    server.fn_handler::<anyhow::Error, _>("/ota", esp_idf_svc::http::Method::Post, |mut req| {
+        info!("[OTA] Firmware upload started");
+
+        let mut ota = esp_idf_svc::ota::EspOta::new()
+            .map_err(|e| anyhow::anyhow!("OTA init: {:?}", e))?;
+        let mut update = ota
+            .initiate_update()
+            .map_err(|e| anyhow::anyhow!("OTA initiate: {:?}", e))?;
+
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        let mut write_err: Option<String> = None;
+
+        loop {
+            let n = match req.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    write_err = Some(format!("read error: {:?}", e));
+                    break;
+                }
+            };
+            if let Err(e) = update.write_all(&buf[..n]) {
+                write_err = Some(format!("write error: {:?}", e));
+                break;
+            }
+            total += n;
+        }
+
+        if let Some(err) = write_err {
+            error!("[OTA] Aborting: {}", err);
+            let _ = update.abort();
+            req.into_response(500, Some("OTA Failed"), &[("Content-Type", "text/plain")])?
+                .write_all(format!("OTA failed: {}", err).as_bytes())?;
+            return Ok(());
+        }
+
+        info!("[OTA] Received {} bytes — completing update", total);
+        update
+            .complete()
+            .map_err(|e| anyhow::anyhow!("OTA complete: {:?}", e))?;
+
+        req.into_response(200, Some("OK"), &[("Content-Type", "text/plain")])?
+            .write_all(format!("OTA OK ({} bytes) — rebooting", total).as_bytes())?;
+
+        info!("[OTA] Update applied — rebooting in 500 ms");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            unsafe { esp_idf_sys::esp_restart() };
+        });
+
+        Ok(())
+    })?;
+
+    info!("[WEB] Server started (/, /save, /ota)");
     Ok(server)
 }
 
-// Decode application/x-www-form-urlencoded body into key-value pairs.
-fn parse_form_urlencoded(body: &[u8]) -> Result<Vec<(String, String)>> {
-    let s = std::str::from_utf8(body)?;
-    let mut pairs = Vec::new();
-    for part in s.split('&') {
-        let mut it = part.splitn(2, '=');
-        let key = url_decode(it.next().unwrap_or(""));
-        let val = url_decode(it.next().unwrap_or(""));
-        pairs.push((key, val));
-    }
-    Ok(pairs)
-}
-
-fn url_decode(s: &str) -> String {
-    // Percent-encoded UTF-8: collect raw bytes first, then interpret as UTF-8.
-    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
-    let src = s.as_bytes();
-    let mut i = 0;
-    while i < src.len() {
-        match src[i] {
-            b'+' => { bytes.push(b' '); i += 1; }
-            b'%' if i + 2 < src.len() => {
-                if let (Some(h), Some(l)) = (hex_val(src[i + 1]), hex_val(src[i + 2])) {
-                    bytes.push(h << 4 | l);
-                    i += 3;
-                } else {
-                    bytes.push(b'%');
-                    i += 1;
-                }
-            }
-            b => { bytes.push(b); i += 1; }
+fn read_body<R: Read>(r: &mut R) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
         }
     }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    body
 }

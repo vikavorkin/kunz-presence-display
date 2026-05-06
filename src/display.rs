@@ -5,11 +5,11 @@ use embedded_graphics::{
     },
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{
-        Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle,
-        CornerRadii,
-    },
+    primitives::{CornerRadii, Line, PrimitiveStyle, Rectangle, RoundedRectangle},
     text::{Baseline, Text},
+};
+use kunz_presence_display::logic::{
+    format_date_from_ms, format_elapsed, format_time_from_ms,
 };
 use profont::PROFONT_24_POINT;
 
@@ -273,54 +273,5 @@ pub fn draw_ap_splash<D: DrawTarget<Color = Rgb565>>(
     text_sm(d, hint, (SCREEN_W - hw) / 2, SCREEN_H - 12, 0x4208, 0x0000);
 }
 
-// ── Time formatting helpers ──────────────────────────────────────
-
-fn format_elapsed(total_secs: u64) -> String {
-    let s = total_secs % 60;
-    let m = (total_secs / 60) % 60;
-    let h = (total_secs / 3600) % 24;
-    let d = total_secs / 86400;
-
-    if d > 0 {
-        format!("{}d {:02}h {:02}m {:02}s", d, h, m, s)
-    } else if h > 0 {
-        format!("{}h {:02}m {:02}s", h, m, s)
-    } else {
-        format!("{:02}m {:02}s", m, s)
-    }
-}
-
-fn format_time_from_ms(ms: u64) -> String {
-    let secs = ms / 1000;
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
-}
-
-fn format_date_from_ms(ms: u64) -> String {
-    // Compute calendar date from Unix timestamp (seconds)
-    let unix_secs = ms / 1000;
-    let (day, month, year) = unix_to_date(unix_secs);
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    format!("{:02} {} {:04}", day, MONTHS[(month - 1) as usize], year)
-}
-
-fn unix_to_date(secs: u64) -> (u32, u32, u32) {
-    // Proleptic Gregorian calendar
-    let days = secs / 86400;
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (d as u32, m as u32, y as u32)
-}
+// format_elapsed, format_time_from_ms, format_date_from_ms live in
+// kunz_presence_display::logic and are imported at the top of this file.

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
+use kunz_presence_display::logic::build_telegram_json;
 use log::{error, info};
 use std::io::Write;
 
@@ -13,7 +14,7 @@ pub fn send_message(bot_token: &str, chat_id: &str, text: &str) -> Result<bool> 
     }
 
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
-    let body = build_json(chat_id, text);
+    let body = build_telegram_json(chat_id, text);
 
     info!("[TG] Sending to chat {}: {}", chat_id, text);
 
@@ -45,23 +46,4 @@ pub fn send_message(bot_token: &str, chat_id: &str, text: &str) -> Result<bool> 
         error!("[TG] HTTP {}", status);
         Ok(false)
     }
-}
-
-fn build_json(chat_id: &str, text: &str) -> String {
-    format!(r#"{{"chat_id":"{}","text":"{}"}}"#, chat_id, json_escape(text))
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '"'  => out.push_str(r#"\""#),
-            '\\' => out.push_str(r#"\\"#),
-            '\n' => out.push_str(r#"\n"#),
-            '\r' => out.push_str(r#"\r"#),
-            '\t' => out.push_str(r#"\t"#),
-            c    => out.push(c),
-        }
-    }
-    out
 }

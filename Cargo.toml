@@ -1,0 +1,44 @@
+[package]
+name = "kunz-presence-display"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+# Library crate: pure-Rust logic, no ESP-IDF deps.
+# Compiled for both the embedded target and the host.
+# Test with: cargo test --target x86_64-unknown-linux-gnu --lib
+[lib]
+name = "kunz_presence_display"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kunz-presence-display"
+path = "src/main.rs"
+harness = false
+
+[profile.dev]
+opt-level = "z"
+debug = true
+overflow-checks = false
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+debug = false
+panic = "abort"
+overflow-checks = false
+
+[dependencies]
+esp-idf-sys  = { version = "0.35", features = ["binstart"] }
+esp-idf-hal  = "0.44"
+esp-idf-svc  = { version = "0.48", features = ["alloc"] }
+embedded-svc = "0.28"
+embedded-hal = "1.0"
+embedded-graphics = "0.8"
+mipidsi      = "0.9"
+profont      = "0.2"
+anyhow       = "1"
+log          = "0.4"
+
+[build-dependencies]
+embuild = "0.31"

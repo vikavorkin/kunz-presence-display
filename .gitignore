@@ -1,3 +1,7 @@
-.pio
-.pioenvs
-.piolibdeps
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# ESP-IDF build artifacts
+.embuild/
+sdkconfig

@@ -1,0 +1,43 @@
+{
+  "name": "Kunz Presence Display — ESP32 Rust",
+
+  // Official Espressif image: Xtensa Rust toolchain, ESP-IDF v5.x, espflash, ldproxy.
+  // Tags: ghcr.io/esp-rs/idf-rust:<MCU>_latest  or  <MCU>_<rust-version>
+  "image": "ghcr.io/esp-rs/idf-rust:esp32_latest",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        // Rust IDE support
+        "rust-lang.rust-analyzer",
+        // TOML editing (Cargo.toml, sdkconfig)
+        "tamasfe.even-better-toml",
+        // Inline crate version hints in Cargo.toml
+        "serayuzgur.crates"
+      ],
+      "settings": {
+        // rust-analyzer cannot cross-compile to the Xtensa target, so point it
+        // at the host-native [lib] crate (src/logic.rs) which has no ESP-IDF
+        // dependencies.  Full diagnostics + completions work for all pure-Rust
+        // code; the [[bin]] target is built from the terminal.
+        "rust-analyzer.cargo.target": "x86_64-unknown-linux-gnu",
+        "rust-analyzer.check.allTargets": false,
+        "rust-analyzer.cargo.buildScripts.enable": true,
+
+        // Suppress expected "unresolved import" noise from ESP-IDF crates
+        // when opening embedded source files in the editor.
+        "rust-analyzer.diagnostics.disabled": [
+          "unresolved-extern-crate",
+          "unresolved-import"
+        ]
+      }
+    }
+  },
+
+  // esptool is needed by scripts/ota_upload.sh for ELF→binary conversion.
+  // The base image ships Python 3; esptool may or may not be pre-installed.
+  "postCreateCommand": "pip install --upgrade --quiet esptool 2>/dev/null || pip3 install --upgrade --quiet esptool 2>/dev/null || true",
+
+  // The image creates a non-root user named 'esp'.
+  "remoteUser": "esp"
+}

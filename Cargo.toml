@@ -1,0 +1,36 @@
+[package]
+name = "kunz-presence-display"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[[bin]]
+name = "kunz-presence-display"
+harness = false
+
+[profile.dev]
+opt-level = "z"
+debug = true
+overflow-checks = false
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+debug = false
+panic = "abort"
+overflow-checks = false
+
+[dependencies]
+esp-idf-sys  = { version = "0.35", features = ["binstart"] }
+esp-idf-hal  = "0.44"
+esp-idf-svc  = { version = "0.48", features = ["alloc"] }
+embedded-svc = "0.28"
+embedded-hal = "1.0"
+embedded-graphics = "0.8"
+mipidsi      = "0.9"
+profont      = "0.2"
+anyhow       = "1"
+log          = "0.4"
+
+[build-dependencies]
+embuild = "0.31"
